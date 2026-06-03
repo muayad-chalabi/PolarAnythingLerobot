@@ -1,0 +1,4 @@
+data/
+results/
+__pycache__/
+model/PA_Final_Model.pth
