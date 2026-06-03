@@ -41,21 +41,41 @@ class PolarControlTest(ControlNetModel):
             return {"down_block_res_samples": out_down, "mid_block_res_sample": out_mid}
         return out_down, out_mid
 
+def normalize_to_unit(image):
+    if image.dtype == np.uint8:
+        scale = 255.0
+    elif image.dtype == np.uint16:
+        scale = 65535.0
+    else:
+        max_val = float(np.max(image))
+        scale = max_val if max_val > 1.0 else 1.0
+    image = image.astype(np.float32) / scale
+    return np.clip(image, 0.0, 1.0)
+
 def preprocess_image(image_path):
     image = cv2.imread(image_path, cv2.IMREAD_UNCHANGED)
-    image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+    if image is None:
+        raise ValueError(f"Cannot read image: {image_path}")
+    if image.ndim == 2:
+        image = cv2.cvtColor(image, cv2.COLOR_GRAY2RGB)
+    elif image.shape[2] == 4:
+        image = cv2.cvtColor(image, cv2.COLOR_BGRA2RGB)
+    else:
+        image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
     h, w, _ = image.shape
     h, w = (h // 8) * 8, (w // 8) * 8
     image = cv2.resize(image, (w, h))
-    image = image / np.max(image)
-    image = image.astype(np.float32)
+    image = normalize_to_unit(image)
     tensor_image = torch.from_numpy(image).permute(2, 0, 1).unsqueeze(0).float()
-    tensor_image = tensor_image * 2 - 1
     return tensor_image, (h, w)
 
 def save_output(output, save_path):
     output = np.clip(output, 0, 1)
-    output = (output * 65535).astype(np.uint16)
+    ext = os.path.splitext(save_path)[1].lower()
+    if ext in ['.jpg', '.jpeg']:
+        output = (output * 255).round().astype(np.uint8)
+    else:
+        output = (output * 65535).round().astype(np.uint16)
     cv2.imwrite(save_path, cv2.cvtColor(output, cv2.COLOR_RGB2BGR))
 
 def test(pipeline, input_folder, save_folder, steps=20):
@@ -107,9 +127,8 @@ if __name__ == '__main__':
     pipeline.unet.requires_grad_(False)
     pipeline.controlnet.requires_grad_(False)
 
-    checkpoint = torch.load(args.checkpoint_path, map_location='cuda' if torch.cuda.is_available() else 'cpu')
+    checkpoint = torch.load(args.checkpoint_path, map_location='cpu')
     pipeline.unet.load_state_dict(remove_module_prefix(checkpoint['unet_state_dict']))
     pipeline.controlnet.controlnet.load_state_dict(remove_module_prefix(checkpoint['controlnet_state_dict']))
 
     test(pipeline, args.input_folder, args.results_folder, args.steps)
-
