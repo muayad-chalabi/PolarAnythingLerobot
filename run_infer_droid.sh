@@ -1,6 +1,9 @@
 #!/bin/bash
 set -euo pipefail
 
+# Silence TensorFlow C++ startup logs; TensorFlow is only used for TFDS input loading.
+export TF_CPP_MIN_LOG_LEVEL="${TF_CPP_MIN_LOG_LEVEL:-2}"
+
 # ========== DROID / model config ==========
 CHECKPOINT="runwayml/stable-diffusion-v1-5"
 CHECKPOINT_PATH=./model/PA_Final_Model.pth
@@ -29,6 +32,8 @@ FRAME_STRIDE=1
 MAX_FRAMES=0
 SAVE_ACTIONS=true
 LOG_LATENTS=false
+# Keep TensorFlow/TFDS off the GPU so PyTorch can use DEVICE for inference.
+DISABLE_TF_GPU=true
 
 # ========== Inference config ==========
 STEPS=20
@@ -61,6 +66,11 @@ PY_SCRIPT=infer_droid.py
 DETERMINISTIC_ARG=(--no-deterministic)
 if [ "$DETERMINISTIC" = true ]; then
   DETERMINISTIC_ARG=(--deterministic)
+fi
+
+DISABLE_TF_GPU_ARG=(--no-disable_tf_gpu)
+if [ "$DISABLE_TF_GPU" = true ]; then
+  DISABLE_TF_GPU_ARG=(--disable_tf_gpu)
 fi
 
 METRICS_ARG=()
@@ -122,6 +132,7 @@ python "$PY_SCRIPT" \
   --guidance_scale "$GUIDANCE_SCALE" \
   --fixed_seed "$FIXED_SEED" \
   "${DETERMINISTIC_ARG[@]}" \
+  "${DISABLE_TF_GPU_ARG[@]}" \
   --denoise_strength "$DENOISE_STRENGTH" \
   --temporal_mode "$TEMPORAL_MODE" \
   --latent_noise_sigma "$LATENT_NOISE_SIGMA" \

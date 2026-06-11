@@ -7,8 +7,11 @@ import time
 from datetime import datetime
 from pathlib import Path
 
+os.environ.setdefault("TF_CPP_MIN_LOG_LEVEL", "2")
+
 import cv2
 import numpy as np
+import tensorflow as tf
 import tensorflow_datasets as tfds
 import torch
 from diffusers import StableDiffusionControlNetPipeline, UNet2DConditionModel
@@ -32,6 +35,26 @@ from infer_vid import (
 )
 from model.utils import remove_module_prefix
 
+
+
+
+def configure_tensorflow(disable_tf_gpu):
+    if not disable_tf_gpu:
+        return
+    try:
+        tf.config.set_visible_devices([], "GPU")
+        print("TensorFlow GPU access disabled; TFDS input loading will run on CPU while PyTorch handles inference GPU usage.")
+    except RuntimeError as exc:
+        print(f"TensorFlow GPU visibility was already initialized; continuing with PyTorch device selection. Details: {exc}")
+
+def print_torch_device_info(device):
+    if device.type != "cuda":
+        print("PyTorch inference device: CPU")
+        return
+    index = device.index if device.index is not None else torch.cuda.current_device()
+    name = torch.cuda.get_device_name(index)
+    total_gb = torch.cuda.get_device_properties(index).total_memory / (1024 ** 3)
+    print(f"PyTorch inference device: cuda:{index} ({name}, {total_gb:.1f} GiB total)")
 
 def tensor_to_numpy(value):
     if hasattr(value, "numpy"):
@@ -217,6 +240,7 @@ def run_episode_inference(args):
 
     device = resolve_device(args.device)
     print(f"Using inference device: {device}")
+    print_torch_device_info(device)
     effective_steps = get_effective_steps(args.steps, args.denoise_strength)
     print(f"Denoise strength: {args.denoise_strength:.2f} -> {effective_steps} steps")
 
@@ -379,6 +403,7 @@ def build_episode_worker_command(args, episode_index):
         "--max_frames", str(args.max_frames),
     ]
     append_optional_flag(command, args, "deterministic", "deterministic")
+    append_optional_flag(command, args, "disable_tf_gpu", "disable_tf_gpu")
     append_optional_flag(command, args, "metrics", "metrics")
     append_optional_flag(command, args, "metrics_side_by_side", "metrics_side_by_side")
     append_optional_flag(command, args, "vae_slicing", "vae_slicing")
@@ -506,6 +531,8 @@ def main():
     parser.add_argument("--fixed_seed", type=int, default=1234, help="Fixed seed for deterministic inference (-1 to disable)")
     parser.add_argument("--deterministic", action=argparse.BooleanOptionalAction, default=True,
                         help="Enable deterministic CUDA behavior")
+    parser.add_argument("--disable_tf_gpu", action=argparse.BooleanOptionalAction, default=True,
+                        help="Keep TensorFlow/TFDS off GPU so PyTorch can use the selected inference GPU")
     parser.add_argument("--denoise_strength", type=float, default=1.0,
                         help="Denoise strength in (0, 1]. Lower values reduce diffusion steps")
     parser.add_argument("--temporal_mode", type=str, default="none",
@@ -553,6 +580,8 @@ def main():
         raise ValueError("--frame_stride must be positive.")
     if args.output_fps <= 0:
         raise ValueError("--output_fps must be positive.")
+
+    configure_tensorflow(args.disable_tf_gpu)
 
     if args.episode_index >= 0:
         run_episode_inference(args)
