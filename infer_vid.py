@@ -1,6 +1,8 @@
 import argparse
 import math
 import os
+import subprocess
+import sys
 import time
 from datetime import datetime
 from pathlib import Path
@@ -200,6 +202,147 @@ def get_effective_steps(steps, denoise_strength):
         raise ValueError("denoise_strength must be in (0, 1].")
     return max(1, int(round(steps * denoise_strength)))
 
+def resolve_device(device_arg):
+    if device_arg == "auto":
+        return torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    device = torch.device(device_arg)
+    if device.type == "cuda" and not torch.cuda.is_available():
+        raise RuntimeError(f"Requested {device_arg}, but CUDA is not available.")
+    return device
+
+def has_batch_inputs(args):
+    return bool(args.input_videos) or bool(args.input_folder)
+
+def discover_batch_videos(args):
+    videos = []
+    if args.input_videos:
+        videos.extend(args.input_videos)
+    if args.input_folder:
+        folder = Path(args.input_folder)
+        videos.extend(str(path) for path in sorted(folder.glob(args.input_glob)))
+    videos = [str(Path(video)) for video in videos]
+    unique_videos = []
+    seen = set()
+    for video in videos:
+        key = os.path.abspath(video)
+        if key not in seen:
+            unique_videos.append(video)
+            seen.add(key)
+    if not unique_videos:
+        raise ValueError("No videos found. Provide --input_videos or --input_folder with a matching --input_glob.")
+    return unique_videos
+
+def get_device_memory_gb(device_arg):
+    device = resolve_device(device_arg)
+    if device.type != "cuda":
+        return None
+    index = device.index if device.index is not None else torch.cuda.current_device()
+    props = torch.cuda.get_device_properties(index)
+    return props.total_memory / (1024 ** 3)
+
+def estimate_memory_per_video_gb(args):
+    if args.memory_per_video_gb > 0:
+        return args.memory_per_video_gb
+    # One worker loads its own SD/ControlNet copy. This default is conservative
+    # and intentionally leaves headroom for activations, latents, and CUDA cache.
+    base = 7.0
+    if not args.vae_on_cpu:
+        base += 1.5
+    if not args.vae_slicing:
+        base += 0.75
+    if args.vae_tiling:
+        base -= 0.25
+    return max(base, 4.0)
+
+def auto_parallelism(args, video_count):
+    if args.batch_max_parallel > 0:
+        return max(1, min(args.batch_max_parallel, video_count))
+    total_gb = get_device_memory_gb(args.device)
+    if total_gb is None:
+        return 1
+    usable_gb = max(0.0, total_gb * args.gpu_memory_fraction - args.gpu_memory_reserve_gb)
+    per_video_gb = estimate_memory_per_video_gb(args)
+    parallel = max(1, int(usable_gb // per_video_gb))
+    parallel = min(parallel, video_count)
+    print(
+        f"Detected {total_gb:.1f} GiB on {resolve_device(args.device)}; "
+        f"using {usable_gb:.1f} GiB after reserve/fraction and estimating "
+        f"{per_video_gb:.1f} GiB per video worker -> {parallel} parallel video(s)."
+    )
+    return parallel
+
+def append_optional_flag(command, args, attr, flag_name):
+    value = getattr(args, attr)
+    if value is True:
+        command.append(f"--{flag_name}")
+    elif value is False:
+        command.append(f"--no-{flag_name}")
+
+def build_single_video_command(args, video_path):
+    command = [
+        sys.executable,
+        str(Path(__file__).resolve()),
+        "--checkpoint", args.checkpoint,
+        "--checkpoint_path", args.checkpoint_path,
+        "--input_video", video_path,
+        "--results_folder", args.results_folder,
+        "--steps", str(args.steps),
+        "--guidance_scale", str(args.guidance_scale),
+        "--fixed_seed", str(args.fixed_seed),
+        "--denoise_strength", str(args.denoise_strength),
+        "--temporal_mode", args.temporal_mode,
+        "--latent_noise_sigma", str(args.latent_noise_sigma),
+        "--flow_backend", args.flow_backend,
+        "--output_blend_alpha", str(args.output_blend_alpha),
+        "--polar_smoothing_mode", args.polar_smoothing_mode,
+        "--device", args.device,
+        "--run_mode", "full" if args.run_mode == "interactive" else args.run_mode,
+    ]
+    append_optional_flag(command, args, "deterministic", "deterministic")
+    append_optional_flag(command, args, "metrics", "metrics")
+    append_optional_flag(command, args, "metrics_side_by_side", "metrics_side_by_side")
+    append_optional_flag(command, args, "vae_slicing", "vae_slicing")
+    append_optional_flag(command, args, "vae_tiling", "vae_tiling")
+    append_optional_flag(command, args, "vae_on_cpu", "vae_on_cpu")
+    if args.output_name:
+        command.extend(["--output_name", args.output_name])
+    return command
+
+def run_batch(args):
+    if args.run_mode == "preview":
+        raise ValueError("Batch mode does not support --run_mode preview because it only saves first-frame previews.")
+    videos = discover_batch_videos(args)
+    max_parallel = auto_parallelism(args, len(videos))
+    os.makedirs(args.results_folder, exist_ok=True)
+    print(f"Batching {len(videos)} video(s) with up to {max_parallel} concurrent worker(s).")
+
+    pending = list(videos)
+    running = []
+    failures = []
+    while pending or running:
+        while pending and len(running) < max_parallel:
+            video = pending.pop(0)
+            command = build_single_video_command(args, video)
+            print(f"Starting {video}")
+            running.append((video, subprocess.Popen(command)))
+
+        time.sleep(2.0)
+        still_running = []
+        for video, proc in running:
+            code = proc.poll()
+            if code is None:
+                still_running.append((video, proc))
+            elif code != 0:
+                failures.append((video, code))
+                print(f"FAILED {video} with exit code {code}")
+            else:
+                print(f"Finished {video}")
+        running = still_running
+
+    if failures:
+        failed = ", ".join(f"{video} (exit {code})" for video, code in failures)
+        raise RuntimeError(f"Batch inference failed for: {failed}")
+
 class TemporalConsistencyModule:
     def __init__(
         self,
@@ -388,8 +531,14 @@ def main():
                         help='Base Stable Diffusion checkpoint')
     parser.add_argument('--checkpoint_path', type=str, default='./model/PA_Final_Model.pth',
                         help='Checkpoint .pth file for model weights')
-    parser.add_argument('--input_video', type=str, required=True,
-                        help='Path to input video')
+    parser.add_argument('--input_video', type=str, default='',
+                        help='Path to one input video')
+    parser.add_argument('--input_videos', type=str, nargs='*', default=None,
+                        help='Paths to multiple input videos to process as a batch')
+    parser.add_argument('--input_folder', type=str, default='',
+                        help='Folder containing videos to process as a batch')
+    parser.add_argument('--input_glob', type=str, default='*.mp4',
+                        help='Glob used with --input_folder (default: *.mp4)')
     parser.add_argument('--results_folder', type=str, default='./results',
                         help='Folder to save results')
     parser.add_argument('--steps', type=int, default=20, help='Number of denoising steps')
@@ -423,7 +572,30 @@ def main():
                         help='Enable VAE tiling to reduce memory usage')
     parser.add_argument('--vae_on_cpu', action=argparse.BooleanOptionalAction, default=True,
                         help='Keep VAE on CPU to avoid CUDA OOM during decode')
+    parser.add_argument('--device', type=str, default='auto',
+                        help='Inference device: auto, cpu, cuda, cuda:0, cuda:1, etc.')
+    parser.add_argument('--run_mode', type=str, default='interactive',
+                        choices=['interactive', 'preview', 'full', '10fps'],
+                        help='Video run mode. Use full or 10fps for non-interactive batch jobs.')
+    parser.add_argument('--batch_max_parallel', type=int, default=0,
+                        help='Max videos to run in parallel. 0 auto-detects from GPU memory.')
+    parser.add_argument('--gpu_memory_fraction', type=float, default=0.85,
+                        help='Fraction of detected GPU memory available to batch workers.')
+    parser.add_argument('--gpu_memory_reserve_gb', type=float, default=2.0,
+                        help='GPU memory to leave unused when auto-sizing batch parallelism.')
+    parser.add_argument('--memory_per_video_gb', type=float, default=0.0,
+                        help='Expected GPU memory per video worker. 0 uses a conservative heuristic.')
     args = parser.parse_args()
+
+    if has_batch_inputs(args):
+        run_batch(args)
+        return
+
+    run_single_video(args)
+
+def run_single_video(args):
+    if not args.input_video:
+        raise ValueError('Provide --input_video for single-video inference, or --input_videos/--input_folder for batch inference.')
 
     if args.deterministic:
         torch.backends.cudnn.deterministic = True
@@ -457,7 +629,8 @@ def main():
     pipeline.unet.load_state_dict(remove_module_prefix(checkpoint['unet_state_dict']))
     pipeline.controlnet.controlnet.load_state_dict(remove_module_prefix(checkpoint['controlnet_state_dict']))
 
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    device = resolve_device(args.device)
+    print(f'Using inference device: {device}')
     pipeline = pipeline.to(device)
     if args.vae_on_cpu:
         pipeline.vae.to("cpu")
@@ -523,7 +696,13 @@ def main():
     log_latent_stats(first_latents_out, 0, "out")
 
     os.makedirs(args.results_folder, exist_ok=True)
-    round_folder = os.path.join(args.results_folder, datetime.now().strftime('%Y%m%d_%H%M%S'))
+    timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+    input_stem = Path(args.input_video).stem
+    round_folder = os.path.join(args.results_folder, f"{timestamp}_{input_stem}")
+    suffix = 1
+    while os.path.exists(round_folder):
+        round_folder = os.path.join(args.results_folder, f"{timestamp}_{input_stem}_{suffix}")
+        suffix += 1
     os.makedirs(round_folder)
 
     first_frame_path = os.path.join(round_folder, 'first_frame.png')
@@ -551,12 +730,18 @@ def main():
     print(
         f"Estimated 10fps run ({reduced_frames} frames): {format_duration(reduced_time)}."
     )
-    print("Options:")
-    print("1) Cancel (only first frame saved as PNG)")
-    print("2) Run full video")
-    print("3) Run video at 10fps")
-
-    choice = input("Select option [1/2/3]: ").strip()
+    if args.run_mode == 'interactive':
+        print("Options:")
+        print("1) Cancel (only first frame saved as PNG)")
+        print("2) Run full video")
+        print("3) Run video at 10fps")
+        choice = input("Select option [1/2/3]: ").strip()
+    elif args.run_mode == 'full':
+        choice = '2'
+    elif args.run_mode == '10fps':
+        choice = '3'
+    else:
+        choice = '1'
     if choice != '2' and choice != '3':
         cap.release()
         print(f"Cancelled. First frame saved to {first_frame_path}")
