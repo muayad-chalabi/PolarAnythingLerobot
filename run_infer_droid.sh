@@ -6,6 +6,10 @@ CHECKPOINT="runwayml/stable-diffusion-v1-5"
 CHECKPOINT_PATH=./model/PA_Final_Model.pth
 DATASET_NAME=droid
 DATA_DIR="gs://gresearch/robotics"
+# For a downloaded TFDS sample that is not registered in your TFDS install, set
+# DATASET_BUILDER_DIR to the version folder that contains dataset_info.json, e.g.
+# DATASET_BUILDER_DIR="/home/chalabi/raid/databases/droid_100/1.0.0"
+DATASET_BUILDER_DIR=
 SPLIT=train
 RESULTS_FOLDER=./results_droid
 
@@ -108,6 +112,7 @@ python "$PY_SCRIPT" \
   --checkpoint_path "$CHECKPOINT_PATH" \
   --dataset_name "$DATASET_NAME" \
   --data_dir "$DATA_DIR" \
+  --builder_dir "$DATASET_BUILDER_DIR" \
   --split "$SPLIT" \
   "${EPISODE_ARGS[@]}" \
   --observation "$OBSERVATION" \

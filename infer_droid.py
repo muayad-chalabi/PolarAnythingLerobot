@@ -97,6 +97,34 @@ def load_pipeline(args, device):
     return pipeline
 
 
+def is_generated_tfds_dir(path):
+    if not path:
+        return False
+    path = Path(path).expanduser()
+    return path.is_dir() and (path / "dataset_info.json").exists()
+
+def resolve_builder_dir(args):
+    if args.builder_dir:
+        builder_dir = Path(args.builder_dir).expanduser()
+        if not is_generated_tfds_dir(builder_dir):
+            raise ValueError(
+                f"--builder_dir must point to a generated TFDS version directory containing dataset_info.json: {builder_dir}"
+            )
+        return str(builder_dir)
+    if is_generated_tfds_dir(args.data_dir):
+        return str(Path(args.data_dir).expanduser())
+    return None
+
+def load_droid_dataset(args):
+    builder_dir = resolve_builder_dir(args)
+    if builder_dir:
+        print(f"Loading TFDS dataset from generated builder directory: {builder_dir}")
+        builder = tfds.builder_from_directory(builder_dir)
+        return builder.as_dataset(split=args.split, shuffle_files=False)
+
+    print(f"Loading registered TFDS dataset '{args.dataset_name}' from data_dir: {args.data_dir}")
+    return tfds.load(args.dataset_name, data_dir=args.data_dir, split=args.split, shuffle_files=False)
+
 def get_episode(dataset, episode_index):
     for episode in dataset.skip(episode_index).take(1):
         return episode
@@ -192,7 +220,7 @@ def run_episode_inference(args):
     effective_steps = get_effective_steps(args.steps, args.denoise_strength)
     print(f"Denoise strength: {args.denoise_strength:.2f} -> {effective_steps} steps")
 
-    dataset = tfds.load(args.dataset_name, data_dir=args.data_dir, split=args.split, shuffle_files=False)
+    dataset = load_droid_dataset(args)
     episode = get_episode(dataset, args.episode_index)
     metadata = episode_metadata_to_dict(episode)
 
@@ -330,6 +358,7 @@ def build_episode_worker_command(args, episode_index):
         "--checkpoint_path", args.checkpoint_path,
         "--dataset_name", args.dataset_name,
         "--data_dir", args.data_dir,
+        "--builder_dir", args.builder_dir,
         "--split", args.split,
         "--episode_index", str(episode_index),
         "--observation", args.observation,
@@ -452,9 +481,12 @@ def main():
     parser.add_argument("--checkpoint_path", type=str, default="./model/PA_Final_Model.pth",
                         help="Checkpoint .pth file for model weights")
     parser.add_argument("--dataset_name", type=str, default="droid",
-                        help="TFDS dataset name, e.g. droid or droid_100")
+                        help="Registered TFDS dataset name, e.g. droid or droid_100")
     parser.add_argument("--data_dir", type=str, default="gs://gresearch/robotics",
-                        help="TFDS data directory or Google Cloud Storage path")
+                        help="TFDS data root, Google Cloud Storage path, or generated dataset version directory")
+    parser.add_argument("--builder_dir", type=str, default="",
+                        help="Generated TFDS dataset version directory containing dataset_info.json; "
+                             "use this for downloaded DROID samples such as /path/droid_100/1.0.0")
     parser.add_argument("--split", type=str, default="train", help="TFDS split")
     parser.add_argument("--episode_index", type=int, default=-1,
                         help="Single episode index to process. Negative values run batch mode.")
