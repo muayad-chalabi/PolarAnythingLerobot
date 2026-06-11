@@ -1,0 +1,13 @@
+accelerate==0.28.0
+datasets==2.18.0
+diffusers==0.17.0
+huggingface-hub==0.19.4
+matplotlib
+numpy==1.26.4
+opencv-python
+pandas
+pillow
+safetensors
+tensorboard
+transformers==4.39.1
+xformers==0.0.21
